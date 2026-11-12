@@ -75,3 +75,20 @@ class MyNexusServiceHandler:
 
 _Versions 1.0.1 and earlier of the `nexus-rpc` package on PyPI belong to an unrelated
 project. The Nexus Python SDK starts at version 1.1.0._
+
+## Dynamic operation handlers
+
+Use `@operation_handler(dynamic=True)` on one factory in a service handler. The
+factory returns an `OperationHandler[nexusrpc.LazyValue, Any]`. Its start method
+receives raw input and reads the original operation name from `ctx.operation`.
+Decode input with `await input.consume(as_type=...)`.
+
+Named operations take precedence. Unmatched start and cancel requests go to the
+service's dynamic handler. Unknown services return `NOT_FOUND`. Register the
+service instance with `Handler` as usual. A service can have at most one dynamic
+handler, and it cannot specify a name. Handlers must support concurrent requests.
+Blocking handlers require an executor.
+
+To reject a name, raise `HandlerError` with type `NOT_FOUND`. That error is final;
+no other handler runs. Middleware runs for the dynamic handler as for named
+operations and receives the unconsumed `LazyValue` as input.

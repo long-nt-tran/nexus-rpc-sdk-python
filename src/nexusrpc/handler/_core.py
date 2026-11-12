@@ -109,7 +109,7 @@ from typing_extensions import Self, TypeGuard
 from nexusrpc._common import HandlerError, HandlerErrorType
 from nexusrpc._serializer import LazyValueT
 from nexusrpc._service import ServiceDefinition
-from nexusrpc._util import get_service_definition, is_async_callable
+from nexusrpc._util import get_operation, get_service_definition, is_async_callable
 
 from ._common import (
     CancelOperationContext,
@@ -283,10 +283,11 @@ class Handler(BaseServiceCollectionHandler):
             input: The input to the operation, as a LazyValue.
         """
         service_handler = self._get_service_handler(ctx.service)
-        op_handler = self._get_operation_handler(ctx, service_handler, ctx.operation)
-
-        op_defn = service_handler.service.operation_definitions[ctx.operation]
-        deserialized_input = await input.consume(as_type=op_defn.input_type)
+        handler, input_type = service_handler._resolve_operation(ctx.operation)  # pyright: ignore[reportPrivateUsage]
+        op_handler = self._get_operation_handler(ctx, handler)
+        deserialized_input = (
+            input if input_type is None else await input.consume(as_type=input_type)
+        )
         return await op_handler.start(ctx, deserialized_input)
 
     async def cancel_operation(self, ctx: CancelOperationContext, token: str) -> None:
@@ -297,17 +298,20 @@ class Handler(BaseServiceCollectionHandler):
             token: The operation token.
         """
         service_handler = self._get_service_handler(ctx.service)
-        op_handler = self._get_operation_handler(ctx, service_handler, ctx.operation)
+        handler = service_handler.get_operation_handler(ctx.operation)
+        op_handler = self._get_operation_handler(ctx, handler)
         return await op_handler.cancel(ctx, token)
 
     def _get_operation_handler(
-        self, ctx: OperationContext, service_handler: ServiceHandler, operation: str
+        self,
+        ctx: OperationContext,
+        handler: OperationHandler[Any, Any],
     ) -> MiddlewareSafeOperationHandler:
         """
-        Get the specified handler for the specified operation from the given service_handler and apply all middleware.
+        Wrap the resolved handler for the specified operation and apply all middleware.
         """
         op_handler: MiddlewareSafeOperationHandler = _EnsuredAwaitableOperationHandler(
-            self.executor, service_handler.get_operation_handler(operation)
+            self.executor, handler
         )
 
         for middleware in reversed(self._middleware):
@@ -317,7 +321,10 @@ class Handler(BaseServiceCollectionHandler):
 
     def _validate_all_operation_handlers_are_async(self) -> None:
         for service_handler in self.service_handlers.values():
-            for op_handler in service_handler.operation_handlers.values():
+            handlers = list(service_handler.operation_handlers.values())
+            if service_handler.dynamic_handler is not None:
+                handlers.append(service_handler.dynamic_handler)
+            for op_handler in handlers:
                 _ = self._assert_async_callable(op_handler.start)
                 _ = self._assert_async_callable(op_handler.cancel)
 
@@ -353,6 +360,8 @@ class ServiceHandler:
 
     service: ServiceDefinition
     operation_handlers: dict[str, OperationHandler[Any, Any]]
+    dynamic_handler: Optional[OperationHandler[LazyValueT, Any]] = None
+    """The handler for operation names with no named handler, if configured."""
 
     @classmethod
     def from_user_instance(cls, user_instance: Any) -> Self:
@@ -378,26 +387,48 @@ class ServiceHandler:
         return cls(
             service=service,
             operation_handlers=op_handlers,
+            dynamic_handler=next(
+                (
+                    factory(user_instance)
+                    for factory in factories_by_method_name.values()
+                    if (op := get_operation(factory)) and op.dynamic
+                ),
+                None,
+            ),
         )
 
     def get_operation_handler(self, operation_name: str) -> OperationHandler[Any, Any]:
-        """Return an operation handler, given the operation name."""
-        if operation_name not in self.service.operation_definitions:
+        """Return a named handler, or the dynamic handler for an unknown name."""
+        return self._resolve_operation(operation_name)[0]
+
+    def _resolve_operation(
+        self, name: str
+    ) -> tuple[OperationHandler[Any, Any], type[Any] | None]:
+        """Return the handler for a name and the input type to decode.
+
+        A named operation takes precedence. The dynamic handler receives names that
+        are not in the service definition. Its input type is None, so the caller
+        passes the raw LazyValue.
+        """
+        definition = self.service.operation_definitions.get(name)
+        if definition is None:
+            if self.dynamic_handler is not None:
+                return self.dynamic_handler, None
             raise HandlerError(
                 f"Nexus service definition '{self.service.name}' has no operation "
-                f"'{operation_name}'. There are {len(self.service.operation_definitions)} operations "
+                f"'{name}'. There are {len(self.service.operation_definitions)} operations "
                 f"in the definition.",
                 type=HandlerErrorType.NOT_FOUND,
             )
-        operation_handler = self.operation_handlers.get(operation_name)
-        if operation_handler is None:
+        handler = self.operation_handlers.get(name)
+        if handler is None:
             raise HandlerError(
                 f"Nexus service implementation '{self.service.name}' has no handler for "
-                f"operation '{operation_name}'. There are {len(self.operation_handlers)} "
+                f"operation '{name}'. There are {len(self.operation_handlers)} "
                 f"available operation handlers.",
                 type=HandlerErrorType.NOT_FOUND,
             )
-        return operation_handler
+        return handler, definition.input_type
 
 
 class _Executor:

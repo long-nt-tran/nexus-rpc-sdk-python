@@ -7,6 +7,7 @@ from collections.abc import Awaitable
 from typing import Any, Callable, Generic, Optional
 
 from nexusrpc._common import InputT, OutputT, ServiceHandlerT
+from nexusrpc._serializer import LazyValue, LazyValueT
 from nexusrpc._service import Operation, OperationDefinition, ServiceDefinition
 from nexusrpc._util import (
     _NEXUS_OPERATION_FACTORY_ATTR_NAME,  # pyright: ignore[reportPrivateUsage]
@@ -146,15 +147,35 @@ def collect_operation_handler_factories_by_method_name(
         else set()
     )
     seen = set()
+    has_dynamic = False
     for _, method in inspect.getmembers(user_service_cls, is_callable):
         if factory := get_operation_factory(method):
             if op := get_operation(factory):
+                if op.dynamic:
+                    if op.name:
+                        raise ValueError(
+                            "A dynamic operation handler cannot have a name"
+                        )
+                    if op.input_type not in (LazyValue, LazyValueT):
+                        raise TypeError(
+                            "A dynamic operation handler must accept nexusrpc.LazyValue"
+                        )
+                    if has_dynamic:
+                        raise RuntimeError(
+                            f"Service '{user_service_cls.__name__}' has more than one "
+                            f"dynamic operation handler."
+                        )
+                    has_dynamic = True
                 if op.name in seen:
                     raise RuntimeError(
                         f"Operation '{op.name}' in service '{user_service_cls.__name__}' "
                         f"is defined multiple times."
                     )
-                if service and op.method_name not in service_method_names:
+                if (
+                    service
+                    and not op.dynamic
+                    and op.method_name not in service_method_names
+                ):
                     _names = ", ".join(f"'{s}'" for s in sorted(service_method_names))
                     msg = (
                         f"Operation method name '{op.method_name}' in service handler {user_service_cls} "
@@ -189,9 +210,11 @@ def validate_operation_handler_methods(
     2. The input and output types of the handler method must exactly match the types
        declared in the service definition.
     """
-    operation_handler_factories_by_method_name = (
-        operation_handler_factories_by_method_name.copy()
-    )
+    operation_handler_factories_by_method_name = {
+        name: factory
+        for name, factory in operation_handler_factories_by_method_name.items()
+        if not (operation := get_operation(factory)) or not operation.dynamic
+    }
     for op_defn in service_definition.operation_definitions.values():
         factory = operation_handler_factories_by_method_name.pop(
             op_defn.method_name, None
@@ -329,6 +352,7 @@ def service_definition_from_operation_handler_methods(
                 f"method with an operation handler decorator such as "
                 f"@nexusrpc.handler.sync_operation?"
             )
-        op_defns[op.name] = OperationDefinition.from_operation(op)
+        if not op.dynamic:
+            op_defns[op.name] = OperationDefinition.from_operation(op)
 
     return ServiceDefinition(name=service_name, operation_definitions=op_defns)
